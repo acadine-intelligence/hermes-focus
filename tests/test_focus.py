@@ -150,7 +150,8 @@ def test_done_needs_proof_and_does_not_bounce_back(svc):
         svc.done("ok")
     r = svc.done("Awaited the cart; 50/50 green runs")
     assert r["completed"]["status"] == "completed"
-    assert r["next"]["focus"]["id"] != "session:s_q"  # chat still ends with "?", but it is done
+    shown = [r["next"]["focus"]["id"]] + [c["id"] for c in r["next"]["next"]]
+    assert "session:s_q" not in shown  # chat still ends with "?", but it is done
 
 
 def test_kanban_completion_closes_focus(svc):
