@@ -1,0 +1,20 @@
+name: focus
+version: "0.1.0"
+description: "One thing to work on now. Focus reads what Hermes already knows (open Kanban tasks, chats waiting on you, failing cron jobs, your own commitments), picks one with deterministic, explainable rules, leases it, and nudges the agent when a turn drifts off it. Local only: no network calls, no LLM calls."
+author: Acadine Intelligence
+license: MIT
+homepage: https://github.com/acadine-intelligence/hermes-focus
+kind: standalone
+requires_hermes: ">=0.23.0"
+platforms:
+  - linux
+  - macos
+provides_tools:
+  - focus_now
+  - focus_accept
+  - focus_done
+  - focus_defer
+  - focus_add
+provides_hooks:
+  - pre_llm_call
+  - kanban_task_completed
