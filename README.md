@@ -16,6 +16,8 @@ then:
   4. Migrate billing webhooks to v2  [work in flight]
 ```
 
+![The Focus card in a Desktop chat, with the optional decision model on](docs/card.png)
+
 ## What it does that a prompt cannot
 
 - **Reads real state.** Open Kanban tasks (and which ones unblock others), interactive chats whose last agent message asks you something, cron jobs with a failure streak, and commitments you record. Machine sessions (cron, subagents, workers) are ignored.
