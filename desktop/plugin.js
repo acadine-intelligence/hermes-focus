@@ -1,6 +1,8 @@
 // Focus: one thing to work on now. Desktop half.
 // Backend: /api/plugins/focus/* (dashboard/plugin_api.py on the Hermes host), polled every 30 s.
-// Every write is a direct user click; the pane never accepts, completes or defers on its own.
+// Every write is a direct user click; the pane never accepts, completes, defers or pins on its own.
+// The same card renders inline in any chat when the agent writes ::focus{} alone on a line.
+import * as sdk from '@hermes/plugin-sdk'
 import {
   host, useQuery, useQueryClient, haptic, Button, Input, Codicon,
   STATUSBAR_AREAS, PALETTE_AREA, ROUTES_AREA, SIDEBAR_NAV_AREA
@@ -115,6 +117,7 @@ function FocusCard({ d, act }) {
       }),
       jsx('div', { className: muted, children: f.next_action }),
       jsx('div', { className: faint, children: `${f.gate_reason}: ${(f.evidence || []).slice(0, 3).join('; ')}` }),
+      f.done_when && jsx('div', { className: faint, children: `Done when ${f.done_when}` }),
       leased && jsx(LeaseBar, { focus: f, left: d.lease_left_min }),
       proofOpen
         ? jsxs('div', {
@@ -164,30 +167,60 @@ function FocusCard({ d, act }) {
   })
 }
 
+function whyText(c) {
+  const parts = (c.contributions || []).slice(0, 3).map(([k, v]) => `${k} ${v > 0 ? '+' : ''}${v}`).join(', ')
+  return `${c.gate_reason} · score ${c.score}${parts ? ` (${parts})` : ''}\n${(c.evidence || []).join('; ')}`
+}
+
 function Row({ c, act }) {
-  return jsx('button', {
-    type: 'button',
-    title: 'Focus on this instead',
-    disabled: act.busy,
-    onClick: () => act.run('/accept', { candidate: c.id, }, 'Focus switched'),
+  return jsxs('div', {
     className:
-      'group flex w-full items-center gap-2 rounded-md border border-(--ui-stroke-secondary) px-2.5 py-1.5 text-left ' +
-      'transition-all duration-200 hover:-translate-y-px hover:border-(--ui-accent) active:translate-y-0',
+      'group flex w-full items-center gap-1 rounded-md border border-(--ui-stroke-secondary) pr-1 ' +
+      'transition-all duration-200 hover:-translate-y-px hover:border-(--ui-accent)',
     children: [
-      jsx('span', { className: `w-4 shrink-0 ${faint}`, children: c.n }),
-      jsxs('span', {
-        className: 'flex min-w-0 flex-col',
+      jsxs('button', {
+        type: 'button',
+        title: whyText(c),
+        disabled: act.busy,
+        onClick: () => act.run('/accept', { candidate: c.id }, 'Focus switched'),
+        className: 'flex min-w-0 flex-1 items-center gap-2 px-2.5 py-1.5 text-left active:translate-y-px',
         children: [
-          jsx('span', { className: 'truncate text-xs text-foreground', children: c.title }),
-          jsx('span', { className: faint, children: c.gate_reason })
+          jsx('span', { className: `w-4 shrink-0 ${faint}`, children: c.n }),
+          jsxs('span', {
+            className: 'flex min-w-0 flex-col',
+            children: [
+              jsx('span', { className: 'truncate text-xs text-foreground', children: c.title }),
+              jsx('span', {
+                className: `${faint} ${c.gate <= 1 ? 'text-(--ui-accent)' : ''}`,
+                children: c.gate_reason
+              })
+            ]
+          })
         ]
       }),
-      jsx(Codicon, { name: 'arrow-right', className: 'ml-auto opacity-0 transition-opacity group-hover:opacity-100' })
+      jsx('button', {
+        type: 'button',
+        title: c.pinned ? 'Unpin' : 'Pin: this matters, rank it above inferred work',
+        'aria-label': c.pinned ? 'Unpin' : 'Pin',
+        'aria-pressed': !!c.pinned,
+        disabled: act.busy,
+        onClick: () => act.run('/pin', { candidate: c.id, pinned: !c.pinned }, c.pinned ? 'Unpinned' : 'Pinned'),
+        className:
+          'flex h-6 w-6 shrink-0 items-center justify-center rounded transition-all duration-200 hover:scale-110 ' +
+          (c.pinned ? 'text-(--ui-accent) opacity-100' : 'opacity-0 group-hover:opacity-70 focus-visible:opacity-100'),
+        children: jsx(Codicon, { name: c.pinned ? 'pinned' : 'pin' })
+      })
     ]
   })
 }
 
-function FocusPane() {
+function modelLine(dm) {
+  if (!dm || !dm.on) return ''
+  const n = (dm.judged || 0) + (dm.cached || 0)
+  return ` · decision model ${dm.backend}: ${n} chats judged`
+}
+
+function FocusPane({ compact = false } = {}) {
   const q = useFocus()
   const act = useAct()
   if (q.isLoading) return jsx('div', { className: `p-3 ${muted}`, children: 'Reading open work…' })
@@ -205,8 +238,9 @@ function FocusPane() {
   if (d.mode === 'empty' || !d.focus)
     return jsx('div', { className: `p-3 ${muted}`, children: 'Nothing open. Tell the agent what you must get done, or run /now add.' })
   const today = d.today || {}
+  const rows = (d.ladder || d.next || []).filter(c => c.id !== d.focus.id).slice(0, compact ? 3 : 6)
   return jsxs('div', {
-    className: 'flex h-full flex-col gap-3 overflow-y-auto p-3',
+    className: compact ? 'flex flex-col gap-2.5' : 'flex h-full flex-col gap-3 overflow-y-auto p-3',
     children: [
       d.interrupt &&
         jsxs('div', {
@@ -224,11 +258,13 @@ function FocusPane() {
           ]
         }),
       jsx(FocusCard, { d, act }),
-      (d.next || []).length > 0 &&
-        jsx('div', { className: 'flex flex-col gap-1.5', children: d.next.map(c => jsx(Row, { c, act }, c.id)) }),
+      rows.length > 0 &&
+        jsx('div', { className: 'flex flex-col gap-1.5', children: rows.map(c => jsx(Row, { c, act }, c.id)) }),
       jsx('div', {
         className: `mt-auto ${faint}`,
-        children: `${today.done || 0} done today · ${today.on_focus || 0} turns on focus · ${today.drift || 0} drifted · ${d.counts?.candidates ?? 0} open items`
+        children:
+          `${today.done || 0} done today · ${today.on_focus || 0} turns on focus · ${today.drift || 0} drifted · ` +
+          `${d.counts?.candidates ?? 0} open items${modelLine(d.decision_model)}`
       })
     ]
   })
@@ -261,6 +297,19 @@ export default {
       render: () => jsx('div', { className: 'mx-auto h-full w-full max-w-xl', children: jsx(FocusPane, {}) })
     })
     ctx.register({ id: 'nav', area: SIDEBAR_NAV_AREA, data: { path: '/focus', label: 'Focus', codicon: 'target' } })
+    // Inline card in any chat: the agent writes ::focus{} alone on a line. Attributes are ignored
+    // (they are untrusted model output); the card always shows live backend state, and every
+    // write is still a user click. Older Desktops without the area keep the pane and the chip.
+    if (typeof sdk.TRANSCRIPT_DIRECTIVE_AREA === 'string') {
+      ctx.register({
+        id: 'inline-card',
+        area: sdk.TRANSCRIPT_DIRECTIVE_AREA,
+        data: {
+          name: 'focus',
+          render: () => jsx('div', { className: 'my-1 w-full max-w-md', children: jsx(FocusPane, { compact: true }) })
+        }
+      })
+    }
     ctx.register({
       id: 'open',
       area: PALETTE_AREA,

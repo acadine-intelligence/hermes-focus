@@ -34,6 +34,12 @@ WEIGHTS = {
     "staleness": -2,
 }
 
+# Optional decision-model evidence (see judge.py). The model supplies probabilities; this file owns
+# what they are allowed to do. Between the two thresholds the answer is undecided and the plain
+# rules stand.
+ACCEPT = 0.70
+REJECT = 0.30
+
 # A routine re-rank never replaces a leased focus. Only a candidate at one of these gates, and at a
 # strictly more urgent gate than the focus, is offered as an interruption.
 INTERRUPT_GATES = frozenset({0, 1})
@@ -52,11 +58,21 @@ class Candidate:
     resume: str = ""
     deadline: float | None = None
     score: float = 0.0
+    done_when: str = ""
+    pinned: bool = False
+    judged: dict[str, float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
-        d["gate_reason"] = GATES[self.gate]
+        # A pin lifts an item to gate 1. Say why it is there in the user's own terms.
+        d["gate_reason"] = "you pinned this" if self.pinned and self.gate == 1 else GATES[self.gate]
+        d["contributions"] = self.contributions()
         return d
+
+    def contributions(self) -> list[list[Any]]:
+        """Each factor's share of the score, largest first: [["consequence", 12.0], ...]."""
+        parts = [[k, round(WEIGHTS[k] * self.factors.get(k, 0.0), 1)] for k in WEIGHTS]
+        return sorted([p for p in parts if p[1]], key=lambda p: -abs(p[1]))
 
 
 def _clamp(x: float) -> float:
@@ -103,9 +119,15 @@ def from_kanban(s: dict) -> Candidate:
         action = "Check the running worker and unblock it if it stalls"
     else:
         action = "Start the task or hand it to a worker"
+    if status == "review":
+        done = "the handoff is approved or sent back"
+    elif waiting:
+        done = "the card is no longer blocked"
+    else:
+        done = "the card is done or handed to a worker"
     return Candidate(id=f"kanban:{s['ref']}", title=s["title"], next_action=action, source="kanban",
                      ref=s["ref"], gate=gate, factors=f, evidence=ev,
-                     resume=f"hermes kanban show {s['ref']}")
+                     resume=f"hermes kanban show {s['ref']}", done_when=done)
 
 
 def from_session(s: dict) -> Candidate:
@@ -124,12 +146,14 @@ def from_session(s: dict) -> Candidate:
     if waiting:
         ev.append("the agent's last message asks you something")
     if s.get("pinned"):
-        ev.append("pinned")
+        ev.append("pinned in Hermes")
     action = ("Reply to the open question" if waiting else "Resume where the chat stopped")
     return Candidate(id=f"session:{s['ref']}", title=s["title"], next_action=action, source="session",
                      ref=s["ref"], gate=1 if waiting and idle <= WAIT_FRESH_HOURS else 3,
                      factors=f, evidence=ev,
-                     resume=f"hermes --resume {s['ref']}")
+                     resume=f"hermes --resume {s['ref']}",
+                     done_when=("you have answered in that chat" if waiting
+                                else "the chat's request is finished or parked on purpose"))
 
 
 def from_cron(s: dict) -> Candidate:
@@ -141,7 +165,8 @@ def from_cron(s: dict) -> Candidate:
         ev.append(f"last error: {s['detail']}")
     return Candidate(id=f"cron:{s['ref']}", title=f"Fix failing cron: {s['title']}",
                      next_action="Read the last run output and fix or pause the job", source="cron",
-                     ref=s["ref"], gate=2, factors=f, evidence=ev, resume=f"hermes cron show {s['ref']}")
+                     ref=s["ref"], gate=2, factors=f, evidence=ev, resume=f"hermes cron show {s['ref']}",
+                     done_when="the next run succeeds, or the job is paused on purpose")
 
 
 def from_commitment(c: dict, now: float) -> Candidate:
@@ -161,15 +186,67 @@ def from_commitment(c: dict, now: float) -> Candidate:
     if hours_left is not None:
         ev.append("overdue" if hours_left < 0 else f"due in {_hours(hours_left)}")
     return Candidate(id=c["id"], title=c["title"], next_action=c.get("next_action") or "Define the first step",
-                     source="commitment", ref=c["id"], gate=gate, factors=f, evidence=ev, deadline=deadline)
+                     source="commitment", ref=c["id"], gate=gate, factors=f, evidence=ev, deadline=deadline,
+                     done_when=c.get("done_when") or "you can name the proof (a link, a test result, a sent message)")
 
 
-def build(signals: list[dict], commitments: list[dict], now: float | None = None) -> list[Candidate]:
+def _prob(x: Any) -> float | None:
+    """A usable probability, or None. JSON admits NaN and 1e309, and bool is an int."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return None
+    return float(x) if x == x and 0.0 <= x <= 1.0 else None
+
+
+def apply_judgment(c: Candidate, answers: dict | None, *, fresh: bool) -> None:
+    """Let decision-model evidence move a chat candidate between gates. Policy lives here, in code.
+
+    The model answers three yes/no questions about one chat. It never ranks, never sees other
+    candidates, and a missing or malformed answer changes nothing.
+    """
+    if c.source != "session" or not isinstance(answers, dict):
+        return
+    need, opt, opn = (_prob(answers.get(k)) for k in ("human_needed", "optional_only", "open_commitment"))
+    if need is None or opt is None or opn is None:
+        return
+    c.judged = {"human_needed": need, "optional_only": opt, "open_commitment": opn}
+    if need >= ACCEPT and opn >= ACCEPT:
+        c.gate = 1 if fresh else 3
+        c.factors["consequence"] = max(c.factors.get("consequence", 0.0), 4.0)
+        c.next_action = "Reply to the open question"
+        c.done_when = "you have answered in that chat"
+        c.evidence.append(f"decision model: unfinished work needs your answer ({need:.2f})")
+    elif opt >= ACCEPT and need <= REJECT:
+        c.gate = 4
+        c.next_action = "Nothing owed: the agent only offered optional extras"
+        c.evidence.append(f"decision model: only an optional offer is open ({opt:.2f})")
+    elif opn <= REJECT and need <= REJECT:
+        c.gate = 4
+        c.next_action = "Nothing owed: the request in this chat was finished"
+        c.evidence.append(f"decision model: no unfinished request ({1 - opn:.2f})")
+    else:
+        c.evidence.append(f"decision model: undecided (needs you {need:.2f}, unfinished {opn:.2f}); rules stand")
+
+
+def build(signals: list[dict], commitments: list[dict], now: float | None = None, *,
+          judgments: dict[str, dict] | None = None, pinned: dict[str, float] | None = None) -> list[Candidate]:
     now = time.time() if now is None else now
     makers = {"kanban": from_kanban, "session": from_session, "cron": from_cron}
-    out = [makers[s["source"]](s) for s in signals if s.get("source") in makers]
+    out = []
+    for s in signals:
+        if s.get("source") not in makers:
+            continue
+        c = makers[s["source"]](s)
+        if judgments and c.source == "session" and c.ref in judgments:
+            apply_judgment(c, judgments[c.ref], fresh=float(s.get("idle_hours", 0)) <= WAIT_FRESH_HOURS)
+        out.append(c)
     out += [from_commitment(c, now) for c in commitments if c.get("status", "open") == "open"]
     for c in out:
+        if pinned and c.id in pinned:
+            # Your own word outranks inference: a pin lifts the item to "waiting on you" and wins
+            # ties there. A deadline inside 24 hours still comes first.
+            c.pinned = True
+            c.gate = min(c.gate, 1)
+            c.evidence.insert(0, "you pinned this")
         c.score = _score(c.factors)
     return out
 
@@ -180,7 +257,7 @@ def rank(cands: list[Candidate], *, deferred: dict[str, float] | None = None,
     deferred = deferred or {}
     live = [c for c in cands if deferred.get(c.id, 0) <= now]
     # Commitments win ties inside a gate: a stated commitment outranks inferred work.
-    return sorted(live, key=lambda c: (c.gate, c.source != "commitment", -c.score, c.id))
+    return sorted(live, key=lambda c: (c.gate, not c.pinned, c.source != "commitment", -c.score, c.id))
 
 
 def decide(ranked: list[Candidate], focus: dict | None, now: float | None = None) -> dict[str, Any]:

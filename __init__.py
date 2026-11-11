@@ -29,12 +29,26 @@ _service: FocusService | None = None
 def service() -> FocusService:
     global _service
     if _service is None:
-        cfg = (lambda k, d: _ctx.get_config(k, d)) if _ctx is not None else (lambda k, d: d)
-        _service = FocusService(host.hermes_home(), host.data_dir(),
-                                lease_minutes=int(cfg("lease_minutes", 90)),
-                                window_days=float(cfg("session_window_days", 3)),
-                                kanban_db=host.kanban_db())
+        cfg = (lambda k, d=None: _ctx.get_config(k, d)) if _ctx is not None else (lambda k, d=None: d)
+        llm = None
+        if str(cfg("decision_model", "off")).lower() == "llm" and _ctx is not None:
+            try:
+                llm = _ctx.llm
+            except Exception:
+                logger.debug("focus: ctx.llm unavailable", exc_info=True)
+        _service = host.build_service(cfg, llm=llm)
     return _service
+
+
+def _visual(decision: dict | None = None, session_id: str | None = None) -> dict:
+    """Refresh the HTML card and say how to show it. Text surfaces ignore this and print `card`."""
+    path = service().write_card(decision or service().now(exclude_session=session_id))
+    if not path:
+        return {}
+    return {"visual": {"html": str(path), "show": (
+        f"On Hermes Desktop, put ::preview{{file=\"{path}\"}} alone on its own line to render the card "
+        "inline (buttons included). When the user has the Focus desktop half enabled, ::focus{} alone on "
+        "its own line renders the live card instead. On every other surface, print `card` as plain text.")}}
 
 
 def _ok(**payload: Any) -> str:
@@ -94,7 +108,29 @@ SCHEMAS = {
             "title": {"type": "string"},
             "next_action": {"type": "string", "description": "The first concrete step"},
             "deadline": {"type": "string", "description": "+3h, +2d, today, tomorrow, YYYY-MM-DD or YYYY-MM-DD HH:MM"},
+            "done_when": {"type": "string", "description": "The observable proof that will show it is done"},
         }, "required": ["title"], "additionalProperties": False},
+    },
+    "focus_rank": {
+        "name": "focus_rank",
+        "description": ("Return the whole ranking of the user's open work with the reason for every position: "
+                        "the level (due within 24 h, someone waiting, failing automation, in flight, backlog), "
+                        "the score and its largest factors, the evidence, pins, and any decision-model evidence. "
+                        "Read-only. Call it when the user asks why something ranks where it does, asks for "
+                        "priorities, or wants to choose between items."),
+        "parameters": {"type": "object", "properties": {
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Default 10"},
+        }, "additionalProperties": False},
+    },
+    "focus_pin": {
+        "name": "focus_pin",
+        "description": ("Pin or unpin an item. A pin is the user's own word that the item matters: it lifts the "
+                        "item above inferred work (a deadline inside 24 h still comes first). Only call when the "
+                        "user says so."),
+        "parameters": {"type": "object", "properties": {
+            "candidate": {"type": "string", "description": "Candidate id, ref, unique prefix, or list number"},
+            "pinned": {"type": "boolean", "description": "false to unpin; default true"},
+        }, "required": ["candidate"], "additionalProperties": False},
     },
 }
 
@@ -102,7 +138,7 @@ SCHEMAS = {
 def focus_now(args: dict, **kw: Any) -> str:
     try:
         d = service().now(exclude_session=kw.get("session_id"))
-        return _ok(decision=d, card=render.card(d))
+        return _ok(decision=d, card=render.card(d), **_visual(d))
     except Exception as exc:
         logger.exception("focus_now failed")
         return _err(exc)
@@ -110,8 +146,9 @@ def focus_now(args: dict, **kw: Any) -> str:
 
 def focus_accept(args: dict, **kw: Any) -> str:
     try:
-        return _ok(**service().accept(args.get("candidate"), minutes=args.get("minutes"),
-                                      session_id=kw.get("session_id"), reason=args.get("reason", "")))
+        r = service().accept(args.get("candidate"), minutes=args.get("minutes"),
+                             session_id=kw.get("session_id"), reason=args.get("reason", ""))
+        return _ok(**r, **_visual(session_id=kw.get("session_id")))
     except Exception as exc:
         return _err(exc)
 
@@ -119,15 +156,16 @@ def focus_accept(args: dict, **kw: Any) -> str:
 def focus_done(args: dict, **kw: Any) -> str:
     try:
         r = service().done(args.get("proof", ""), session_id=kw.get("session_id"))
-        return _ok(completed=r["completed"], next_card=render.card(r["next"]))
+        return _ok(completed=r["completed"], next_card=render.card(r["next"]), **_visual(r["next"]))
     except Exception as exc:
         return _err(exc)
 
 
 def focus_defer(args: dict, **kw: Any) -> str:
     try:
-        return _ok(**service().defer(args.get("candidate"), hours=float(args.get("hours", 24)),
-                                     reason=args.get("reason", ""), session_id=kw.get("session_id")))
+        r = service().defer(args.get("candidate"), hours=float(args.get("hours", 24)),
+                            reason=args.get("reason", ""), session_id=kw.get("session_id"))
+        return _ok(**r, **_visual(session_id=kw.get("session_id")))
     except Exception as exc:
         return _err(exc)
 
@@ -135,13 +173,31 @@ def focus_defer(args: dict, **kw: Any) -> str:
 def focus_add(args: dict, **kw: Any) -> str:
     try:
         return _ok(**service().add(args.get("title", ""), next_action=args.get("next_action", ""),
-                                   deadline=args.get("deadline")))
+                                   deadline=args.get("deadline"), done_when=args.get("done_when", "")))
+    except Exception as exc:
+        return _err(exc)
+
+
+def focus_rank(args: dict, **kw: Any) -> str:
+    try:
+        r = service().rank(limit=int(args.get("limit", 10)), exclude_session=kw.get("session_id"))
+        return _ok(ranking=r, text=render.why(r))
+    except Exception as exc:
+        logger.exception("focus_rank failed")
+        return _err(exc)
+
+
+def focus_pin(args: dict, **kw: Any) -> str:
+    try:
+        r = service().pin(args.get("candidate"), on=bool(args.get("pinned", True)), session_id=kw.get("session_id"))
+        return _ok(**r, **_visual(session_id=kw.get("session_id")))
     except Exception as exc:
         return _err(exc)
 
 
 HANDLERS = {"focus_now": focus_now, "focus_accept": focus_accept, "focus_done": focus_done,
-            "focus_defer": focus_defer, "focus_add": focus_add}
+            "focus_defer": focus_defer, "focus_add": focus_add, "focus_rank": focus_rank,
+            "focus_pin": focus_pin}
 
 
 # ---- /now ------------------------------------------------------------------------------------
@@ -151,6 +207,8 @@ USAGE = """/now                          show the focus, or the proposal
 /now done <proof>             complete it with proof, get the next one
 /now defer [n|id] [hours]     snooze it (default 24 h)
 /now add <what> [by <when>]   record a commitment (+3h, tomorrow, 2026-11-11 17:00)
+/now why [n]                  the whole ranking and the reason for every position
+/now pin <n|id>               say an item matters; /now unpin <n|id> takes it back
 /now review [days]            what you finished and how often you drifted"""
 
 
@@ -186,6 +244,13 @@ def run_command(raw: str, session_id: str | None = None) -> str:
             title, _, when = text.partition(" by ")
             r = svc.add(title, deadline=when or None)
             return f"Added: {r['added']['title']}" + (" (with deadline)" if r["added"]["deadline"] else "")
+        if verb in ("why", "rank", "list", "all"):
+            limit = int(rest[0]) if rest and rest[0].isdigit() else 10
+            return render.why(svc.rank(limit=limit, exclude_session=session_id))
+        if verb in ("pin", "unpin"):
+            r = svc.pin(rest[0] if rest else None, on=verb == "pin", session_id=session_id)
+            return (f"{'Pinned' if r['pinned'] else 'Unpinned'}: {r['title']}\n\n"
+                    + render.card(svc.now(exclude_session=session_id)))
         if verb == "review":
             days = int(rest[0]) if rest and rest[0].isdigit() else 7
             return render.review(svc.review(days))
@@ -249,12 +314,15 @@ def _prompt_section(_info: Any = None) -> str:
 # ---- CLI ---------------------------------------------------------------------------------------
 
 def _cli_setup(parser) -> None:
-    parser.add_argument("args", nargs="*", help="now | accept [n] [min] | done <proof> | defer [n] [h] | add <what> [by <when>] | review")
+    parser.add_argument("args", nargs="*", help="now | accept [n] [min] | done <proof> | defer [n] [h] | add <what> [by <when>] | why | pin <n> | unpin <n> | review")
+    parser.add_argument("--html", action="store_true", help="write the visual card and print its path")
     parser.add_argument("--json", action="store_true", help="print the raw decision as JSON")
 
 
 def _cli_handler(args) -> int:
-    if getattr(args, "json", False):
+    if getattr(args, "html", False):
+        print(service().write_card() or "could not write the card")
+    elif getattr(args, "json", False):
         print(json.dumps(service().now(), indent=2, default=str))
     else:
         print(run_command(" ".join(shlex.quote(a) for a in args.args)))
@@ -268,7 +336,7 @@ def register(ctx) -> None:
     _ctx, _service = ctx, None
     for name, handler in HANDLERS.items():
         ctx.register_tool(name=name, toolset=TOOLSET, schema=SCHEMAS[name], handler=handler, emoji="🎯")
-    ctx.register_command("now", _slash, description="One thing to work on now", args_hint="[accept|done|defer|add|review]")
+    ctx.register_command("now", _slash, description="One thing to work on now", args_hint="[accept|done|defer|add|why|pin|review]")
     ctx.register_cli_command("focus", "One thing to work on now", _cli_setup, _cli_handler,
                              description="Show, lease, complete or defer your one focus.")
     ctx.register_hook("pre_llm_call", on_pre_llm_call)

@@ -21,7 +21,7 @@ STATS_DAYS_CAP = 60
 
 def empty() -> dict[str, Any]:
     return {"version": SCHEMA_VERSION, "focus": None, "history": [], "deferred": {},
-            "commitments": [], "stats": {}, "nudged": {}}
+            "commitments": [], "stats": {}, "nudged": {}, "pinned": {}}
 
 
 class Store:
@@ -81,5 +81,7 @@ class Store:
         if len(state["nudged"]) > 200:
             keep = sorted(state["nudged"].items(), key=lambda kv: kv[1])[-100:]
             state["nudged"] = dict(keep)
+        if len(state["pinned"]) > 50:
+            state["pinned"] = dict(sorted(state["pinned"].items(), key=lambda kv: kv[1])[-50:])
         state["commitments"] = [c for c in state["commitments"] if c.get("status") == "open"][-100:] + \
             [c for c in state["commitments"] if c.get("status") != "open"][-50:]

@@ -44,6 +44,15 @@ def _clip(text: Any, n: int) -> str:
     return s if len(s) <= n else s[: n - 1].rstrip() + "…"
 
 
+def clip_ends(text: Any, n: int) -> str:
+    """Keep the head and the tail. The end of a reply is where the ask or the handoff sits."""
+    s = str(text or "").strip()
+    if len(s) <= n:
+        return s
+    half = n // 2
+    return s[:half].rstrip() + "\n[...]\n" + s[-half:].lstrip()
+
+
 def waiting_on_user(text: str) -> bool:
     """True when an assistant message ends by asking the human something."""
     tail = (text or "").strip()[-400:]
@@ -141,7 +150,11 @@ def session_signals(db_path: Path, now: float, errors: list[str], *, window_days
                 continue  # probably still being worked in another window
             last = None
             first_user = None
+            last_user = None
             if {"session_id", "role", "content"} <= mcols:
+                last_user = conn.execute(
+                    "SELECT content FROM messages WHERE session_id = ? AND role = 'user' "
+                    "AND content IS NOT NULL AND content != '' ORDER BY id DESC LIMIT 1", (sid,)).fetchone()
                 last = conn.execute(
                     "SELECT role, content FROM messages WHERE session_id = ? AND role IN ('user','assistant') "
                     "AND content IS NOT NULL AND content != '' ORDER BY id DESC LIMIT 1", (sid,)).fetchone()
@@ -161,6 +174,9 @@ def session_signals(db_path: Path, now: float, errors: list[str], *, window_days
                 "idle_hours": idle_min / 60,
                 "waiting_on_user": last_role == "assistant" and waiting_on_user(last_text),
                 "last_assistant": _clip(last_text, 200) if last_role == "assistant" else "",
+                # Only read by the optional decision model (off by default); never leaves otherwise.
+                "last_user_text": clip_ends(last_user["content"], 700) if last_user else "",
+                "last_assistant_text": clip_ends(last_text, 1600) if last_role == "assistant" else "",
             })
     except sqlite3.Error as exc:
         errors.append(f"sessions: {exc}")

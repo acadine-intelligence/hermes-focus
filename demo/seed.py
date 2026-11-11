@@ -14,7 +14,9 @@ from pathlib import Path
 H = 3600
 
 
-def seed(home: Path, now: float | None = None) -> Path:
+def seed(home: Path, now: float | None = None, *, extras: bool = False) -> Path:
+    """``extras`` adds two chats that the plain rules read the same way and a decision model does not:
+    one where the agent finished and only offered more, one where it is blocked on an approval."""
     now = time.time() if now is None else now
     home.mkdir(parents=True, exist_ok=True)
 
@@ -60,6 +62,20 @@ def seed(home: Path, now: float | None = None) -> Path:
         ("s_r", "user", "refactor ranking", now - 30 * H),
         ("s_r", "assistant", "Refactor is half done; scoring module extracted.", now - 26 * H),
     ])
+    if extras:
+        s.executemany("INSERT INTO sessions (id, source, title, cwd, parent_session_id, started_at, last_activity_at)"
+                      " VALUES (?,?,?,?,?,?,?)", [
+            ("s_opt", "desktop", "Summarise the Q3 churn report", "/work/data", None, now - 4 * H, now - 2 * H),
+            ("s_blk", "cli", "Rotate the staging database password", "/work/infra", None, now - 9 * H, now - 8 * H),
+        ])
+        s.executemany("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?,?,?,?)", [
+            ("s_opt", "user", "summarise the Q3 churn report in five bullets", now - 4 * H),
+            ("s_opt", "assistant", "Here are the five bullets, saved to churn-summary.md. Want me to also turn "
+                                   "them into a slide?", now - 2 * H),
+            ("s_blk", "user", "rotate the staging database password and update the app secrets", now - 9 * H),
+            ("s_blk", "assistant", "New password generated and stored. I have not applied it: applying restarts "
+                                   "the staging API for about a minute. Reply go and I will apply it now.", now - 8 * H),
+        ])
     s.commit()
     s.close()
 
@@ -74,5 +90,6 @@ def seed(home: Path, now: float | None = None) -> Path:
 
 
 if __name__ == "__main__":
-    out = seed(Path(sys.argv[1] if len(sys.argv) > 1 else "demo/home"))
+    args = [a for a in sys.argv[1:] if a != "--extras"]
+    out = seed(Path(args[0] if args else "demo/home"), extras="--extras" in sys.argv)
     print(out)

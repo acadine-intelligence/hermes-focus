@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from . import engine, sources
+from . import engine, render_html, sources
 from .store import Store
 
 DEFAULT_LEASE_MIN = 90
@@ -51,8 +51,13 @@ def parse_deadline(text: str | None, now: float) -> float | None:
 
 class FocusService:
     def __init__(self, home: Path, data_dir: Path, *, lease_minutes: int = DEFAULT_LEASE_MIN,
-                 window_days: float = 3.0, kanban_db: Path | None = None, clock=time.time):
+                 window_days: float = 3.0, kanban_db: Path | None = None, clock=time.time,
+                 judge: Any = None, judge_status: str = "off"):
         self.home = Path(home)
+        self.data_dir = Path(data_dir)
+        self.judge = judge
+        self.judge_status = judge_status
+        self.judge_info: dict[str, Any] = {"backend": judge_status, "on": judge is not None}
         self.store = Store(data_dir)
         self.lease_minutes = int(lease_minutes)
         self.window_days = float(window_days)
@@ -61,11 +66,23 @@ class FocusService:
 
     # ---- reading -----------------------------------------------------------------------------
 
-    def _candidates(self, state: dict, exclude_session: str | None) -> tuple[list[engine.Candidate], list[str], list[dict]]:
-        now = self.clock()
-        signals, errors = sources.collect(self.home, now=now, exclude_session=exclude_session,
+    def _observe(self, exclude_session: str | None) -> tuple[list[dict], list[str], dict[str, dict]]:
+        """Read the sources and, when it is on, ask the decision model. Always runs OUTSIDE the state
+        lock: the drift hook takes that lock on every turn and must never wait on a network call."""
+        signals, errors = sources.collect(self.home, now=self.clock(), exclude_session=exclude_session,
                                           window_days=self.window_days, kanban_db=self.kanban_db)
-        cands = engine.build(signals, state["commitments"], now)
+        judgments: dict[str, dict] = {}
+        if self.judge is not None:
+            judgments, info = self.judge.judge(signals)
+            self.judge_info = {"on": True, **info, "status": self.judge_status}
+        return signals, errors, judgments
+
+    def _candidates(self, state: dict, obs: tuple[list[dict], list[str], dict[str, dict]]
+                    ) -> tuple[list[engine.Candidate], list[str], list[dict]]:
+        signals, errors, judgments = obs
+        now = self.clock()
+        cands = engine.build(signals, state["commitments"], now, judgments=judgments,
+                             pinned=state.get("pinned") or {})
         ranked = engine.rank(cands, deferred=state["deferred"], now=now)
         return ranked, errors, signals
 
@@ -88,6 +105,7 @@ class FocusService:
         state["history"].append(f)
         state["focus"] = None
         if status == "completed":
+            state.get("pinned", {}).pop(f["id"], None)
             # The source may still look open (a chat still ends with a question). Keep the finished
             # item from bouncing straight back as the next proposal.
             state["deferred"][f["id"]] = now + 12 * 3600
@@ -99,15 +117,60 @@ class FocusService:
 
     def now(self, *, exclude_session: str | None = None) -> dict[str, Any]:
         now = self.clock()
+        obs = self._observe(exclude_session)
         with self.store.edit() as state:
-            ranked, errors, signals = self._candidates(state, exclude_session)
+            ranked, errors, signals = self._candidates(state, obs)
             self._reconcile(state, signals, errors, now)
             decision = engine.decide(ranked, state["focus"], now)
             decision["errors"] = errors
             decision["counts"] = {"candidates": len(ranked), "signals": len(signals)}
             decision["today"] = state["stats"].get(_day(now), {})
             decision["generated_at"] = now
+            decision["decision_model"] = dict(self.judge_info)
+            decision["ladder"] = [engine._numbered(c, ranked) for c in ranked[:8]]
         return decision
+
+    def rank(self, *, limit: int = 10, exclude_session: str | None = None) -> dict[str, Any]:
+        """The whole ranking with the reason for every position. Read-only."""
+        now = self.clock()
+        state = self.store.read()
+        ranked, errors, _ = self._candidates(state, self._observe(exclude_session))
+        by_gate: dict[str, int] = {}
+        for c in ranked:
+            by_gate[engine.GATES[c.gate]] = by_gate.get(engine.GATES[c.gate], 0) + 1
+        f = state.get("focus")
+        leased = bool(f and f.get("status") == "active" and f.get("lease_until", 0) > now)
+        return {"ladder": [engine._numbered(c, ranked) for c in ranked[:max(1, min(int(limit), 50))]],
+                "total": len(ranked), "by_gate": by_gate, "errors": errors,
+                "leased_id": f["id"] if leased and f else None,
+                "decision_model": dict(self.judge_info),
+                "rules": " > ".join(engine.GATES[g] for g in sorted(engine.GATES))}
+
+    def pin(self, candidate: str | None, *, on: bool = True, session_id: str | None = None) -> dict[str, Any]:
+        """Pin: your own word that an item matters. It lifts the item above inferred work."""
+        now = self.clock()
+        obs = self._observe(session_id)
+        with self.store.edit() as state:
+            ranked, _, _ = self._candidates(state, obs)
+            pick = self._find(ranked, candidate) if candidate else None
+            if pick is None:
+                raise LookupError(f"no candidate matches {candidate!r}" if candidate else "say which item to pin")
+            if on:
+                state["pinned"][pick.id] = now
+                state["deferred"].pop(pick.id, None)
+            else:
+                state["pinned"].pop(pick.id, None)
+        return {"pinned": on, "id": pick.id, "title": pick.title}
+
+    def write_card(self, decision: dict[str, Any] | None = None) -> Path | None:
+        """Write the visual card (one self-contained HTML file) and return its path."""
+        try:
+            path = self.data_dir / "card.html"
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(render_html.card(decision or self.now()), encoding="utf-8")
+            return path
+        except OSError:
+            return None
 
     # ---- writing -----------------------------------------------------------------------------
 
@@ -131,8 +194,9 @@ class FocusService:
         minutes = int(minutes or self.lease_minutes)
         if not 5 <= minutes <= 480:
             raise ValueError("lease minutes must be between 5 and 480")
+        obs = self._observe(session_id)
         with self.store.edit() as state:
-            ranked, errors, signals = self._candidates(state, session_id)
+            ranked, errors, signals = self._candidates(state, obs)
             self._reconcile(state, signals, errors, now)
             pick = self._find(ranked, candidate)
             if pick is None:
@@ -167,6 +231,7 @@ class FocusService:
         now = self.clock()
         if not 0.25 <= float(hours) <= 24 * 30:
             raise ValueError("defer hours must be between 0.25 and 720")
+        obs = self._observe(session_id)
         with self.store.edit() as state:
             target = None
             f = state["focus"]
@@ -174,7 +239,7 @@ class FocusService:
                 target = f["id"]
                 self._close(state, "deferred", now, reason=reason)
             else:
-                ranked, _, _ = self._candidates(state, session_id)
+                ranked, _, _ = self._candidates(state, obs)
                 pick = self._find(ranked, candidate)
                 if pick is None:
                     raise LookupError(f"no candidate matches {candidate!r}")
@@ -182,7 +247,8 @@ class FocusService:
             state["deferred"][target] = now + float(hours) * 3600
         return {"deferred": target, "until_local": _hhmm(now + float(hours) * 3600)}
 
-    def add(self, title: str, *, next_action: str = "", deadline: str | None = None) -> dict[str, Any]:
+    def add(self, title: str, *, next_action: str = "", deadline: str | None = None,
+            done_when: str = "") -> dict[str, Any]:
         title = " ".join((title or "").split())
         if len(title) < 3:
             raise ValueError("a commitment needs a title")
@@ -190,7 +256,8 @@ class FocusService:
         due = parse_deadline(deadline, now)
         cid = "commitment:" + hashlib.sha1(f"{title}|{now}".encode()).hexdigest()[:8]
         item = {"id": cid, "title": title[:120], "next_action": next_action.strip()[:160],
-                "deadline": due, "status": "open", "created_at": now}
+                "deadline": due, "status": "open", "created_at": now,
+                "done_when": " ".join((done_when or "").split())[:160]}
         with self.store.edit() as state:
             state["commitments"].append(item)
         return {"added": item}
@@ -240,8 +307,9 @@ class FocusService:
         now = self.clock()
         if not f or f.get("status") != "active" or f.get("lease_until", 0) <= now:
             return ""
+        done = f" Done when: {f['done_when']}." if f.get("done_when") else ""
         return (f"The user has one leased focus until {_hhmm(f['lease_until'])}: \"{f['title']}\". "
-                f"Next action: {f['next_action']}. Favour work that moves it. When they finish, suggest "
+                f"Next action: {f['next_action']}.{done} Favour work that moves it. When they finish, suggest "
                 f"`/now done <proof>`; when something else is genuinely more urgent, say so plainly.")
 
     # ---- review ------------------------------------------------------------------------------

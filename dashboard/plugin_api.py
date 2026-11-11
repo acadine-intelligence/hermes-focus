@@ -5,6 +5,8 @@ POST /accept           {candidate?, minutes?}
 POST /done             {proof}
 POST /defer            {candidate?, hours?}
 POST /add              {title, next_action?, deadline?}
+POST /pin              {candidate, pinned?}
+GET  /rank?limit=10    the whole ranking with reasons
 GET  /review?days=7
 
 Every route runs the same deterministic engine as the /now command. Nothing leaves the machine.
@@ -40,14 +42,14 @@ def _load_lib():
 
 _load_lib()
 from hermes_focus_dashboard_lib import host, render  # noqa: E402
-from hermes_focus_dashboard_lib.service import FocusService  # noqa: E402
+from hermes_focus_dashboard_lib.service import FocusService  # noqa: E402,F401
 
 router = APIRouter()
 
 
 def _svc() -> FocusService:
-    # Built per request: host paths follow the active profile.
-    return FocusService(host.hermes_home(), host.data_dir(), kanban_db=host.kanban_db())
+    # Built per request: host paths and settings follow the active profile.
+    return host.build_service()
 
 
 def _wrap(fn) -> dict[str, Any]:
@@ -86,6 +88,16 @@ async def defer(body: dict = Body(default={})) -> dict:
 async def add(body: dict = Body(default={})) -> dict:
     return _wrap(lambda: {**_svc().add(str(body.get("title", "")), next_action=str(body.get("next_action", "")),
                                        deadline=body.get("deadline")), **_state()})
+
+
+@router.post("/pin")
+async def pin(body: dict = Body(default={})) -> dict:
+    return _wrap(lambda: {**_svc().pin(body.get("candidate"), on=bool(body.get("pinned", True))), **_state()})
+
+
+@router.get("/rank")
+async def rank(limit: int = 10) -> dict:
+    return _wrap(lambda: {"ranking": _svc().rank(limit=max(1, min(int(limit), 50)))})
 
 
 @router.get("/review")
