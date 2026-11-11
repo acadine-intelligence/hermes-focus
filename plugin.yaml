@@ -1,6 +1,6 @@
 name: focus
-version: "0.2.0"
-description: "One thing to work on now. Focus reads what Hermes already knows (open Kanban tasks, chats waiting on you, failing cron jobs, your own commitments), picks one with deterministic, explainable rules, leases it, and nudges the agent when a turn drifts off it. Local by default: no network calls and no model calls unless you turn on the optional decision model."
+version: "0.2.1"
+description: "One thing to work on now. Focus reads what Hermes already knows (open Kanban tasks, chats waiting on you, failing cron jobs, your own commitments), picks one with deterministic, explainable rules, leases it, and shows it in a Desktop pane. Quiet by default: it never speaks in your other chats unless you turn the drift guard on. Local by default: no network calls and no model calls unless you turn on the optional decision model."
 author: Acadine Intelligence
 license: MIT
 homepage: https://github.com/acadine-intelligence/hermes-focus
@@ -23,7 +23,7 @@ provides_hooks:
 config_schema:
   lease_minutes: {type: int, default: 90, description: "Length of a focus lease, in minutes"}
   session_window_days: {type: float, default: 3, description: "How many days back to look for chats waiting on you"}
-  drift_guard: {type: bool, default: true, description: "Add one line of context when a turn drifts off the leased focus"}
+  drift_guard: {type: bool, default: false, description: "Off: Focus stays in its pane and never speaks in other chats. On: the agent is told your leased focus and adds one line when a turn drifts off it."}
   decision_model: {type: str, default: "off", description: "off, jev or llm. off keeps Focus fully local. jev sends the last exchange of up to 8 recent chats to the TypeSafe API. llm asks your own Hermes model."}
   decision_model_max_chats: {type: int, default: 8, description: "Most chats judged per refresh when the decision model is on"}
 optional_env:

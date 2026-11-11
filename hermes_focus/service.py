@@ -268,8 +268,9 @@ class FocusService:
         day = state["stats"].setdefault(_day(now), {})
         day[key] = int(day.get(key, 0)) + 1
 
-    def on_turn(self, message: str, *, session_id: str | None) -> str | None:
-        """Record the turn; return a one-line context note when it drifts off a leased focus."""
+    def on_turn(self, message: str, *, session_id: str | None, nudge: bool = True) -> str | None:
+        """Record the turn. With ``nudge``, return a one-line context note when it drifts off a
+        leased focus. Without it the turn is only counted, so the pane can show drift quietly."""
         now = self.clock()
         state = self.store.read()
         f = state.get("focus")
@@ -279,7 +280,7 @@ class FocusService:
         drift = not anchored and engine.is_drift(message, f)
         with self.store.edit() as state:
             self._bump(state, now, "drift" if drift else "on_focus")
-            if not drift:
+            if not drift or not nudge:
                 return None
             last = float(state["nudged"].get(session_id or "-", 0))
             if now - last < NUDGE_COOLDOWN_S:

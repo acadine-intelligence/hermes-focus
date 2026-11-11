@@ -309,6 +309,8 @@ def test_tools_round_trip(plugin):
     assert now["success"] and now["decision"]["mode"] == "proposed"
     acc = json.loads(ctx.tools["focus_accept"]({}, session_id="s_live"))
     assert acc["success"]
+    assert ctx.sections["focus.current"]({}) == ""       # quiet by default
+    ctx.config["drift_guard"] = True
     assert "leased focus" in ctx.sections["focus.current"]({})
     bad = json.loads(ctx.tools["focus_done"]({"proof": ""}))
     assert bad["success"] is False
@@ -334,10 +336,26 @@ def test_hook_skips_unattended_and_subagents(plugin):
     msg = "research the best espresso machines under five hundred dollars"
     assert ctx.hooks["pre_llm_call"](session_id="a", user_message=msg, platform="cron") is None
     assert ctx.hooks["pre_llm_call"](session_id="a", user_message=msg, platform="cli", parent_session_id="p") is None
+    ctx.config["drift_guard"] = True
     out = ctx.hooks["pre_llm_call"](session_id="a", user_message=msg, platform="cli")
     assert out and "[Focus]" in out["context"]
     ctx.config["drift_guard"] = False
     assert ctx.hooks["pre_llm_call"](session_id="b", user_message=msg, platform="cli") is None
+
+
+def test_focus_is_quiet_by_default_and_still_counts_drift(plugin):
+    """Out of the box nothing reaches the model: no drift note, no prompt section. The turn is
+    still counted so the pane can show drift without interrupting any chat."""
+    mod, ctx = plugin
+    assert "drift_guard" not in ctx.config
+    ctx.tools["focus_accept"]({"candidate": "kanban:t_c3"}, session_id="s_live")
+    msg = "research the best espresso machines under five hundred dollars"
+    for sid in ("a", "b", "c"):
+        assert ctx.hooks["pre_llm_call"](session_id=sid, user_message=msg, platform="desktop") is None
+    assert ctx.sections["focus.current"]({}) == ""
+    today = mod.service().now()["today"]
+    assert today["drift"] == 3 and "nudges" not in today
+    assert mod.service().store.read()["nudged"] == {}
 
 
 def test_hook_never_raises(plugin, monkeypatch):

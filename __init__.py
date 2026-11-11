@@ -282,13 +282,21 @@ def _unattended(platform: str | None, parent_session_id: str | None) -> bool:
         return False
 
 
+def _speaks() -> bool:
+    """Whether Focus may put anything in front of the model. Off by default: Focus is a pane, a chip
+    and a command the user opens, and it stays out of every other chat unless the user asks for it."""
+    try:
+        return bool(_ctx is not None and _ctx.get_config("drift_guard", False))
+    except Exception:
+        return False
+
+
 def on_pre_llm_call(session_id=None, user_message=None, platform=None, parent_session_id=None, **_: Any):
-    if _ctx is not None and not _ctx.get_config("drift_guard", True):
-        return None
     if _unattended(platform, parent_session_id) or not isinstance(user_message, str):
         return None
     try:
-        note = service().on_turn(user_message, session_id=session_id)
+        # Always count the turn (the pane shows on-focus and drifted turns). Only speak when asked to.
+        note = service().on_turn(user_message, session_id=session_id, nudge=_speaks())
     except Exception:
         logger.debug("focus drift check failed", exc_info=True)
         return None
@@ -305,6 +313,8 @@ def on_kanban_task_completed(task_id=None, summary=None, **_: Any) -> None:
 
 
 def _prompt_section(_info: Any = None) -> str:
+    if not _speaks():
+        return ""
     try:
         return service().prompt_section()
     except Exception:
